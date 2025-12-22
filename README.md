@@ -18,3 +18,10 @@ def login_user(username, password):
     user = db.query(User).filter(User.username == username, User.password == password).first()
     db.close()
     return user is not None
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "..."
+client_email = "..."
+# ... (rest of JSON)
