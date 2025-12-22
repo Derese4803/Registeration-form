@@ -5,23 +5,22 @@ from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- IMPORTS FROM EXTERNAL FILES ---
+# --- EXTERNAL FILE IMPORTS ---
 try:
     from database import SessionLocal
     from models import Farmer, Woreda, Kebele, create_tables
     from auth import register_user, login_user
 except ImportError:
-    st.error("Error: database.py, models.py, and auth.py must be in the same folder.")
+    st.error("Missing files! Ensure models.py, database.py, and auth.py are in the same folder.")
     st.stop()
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Staff & Farmer System", page_icon="🌾", layout="wide")
+# --- INITIAL SETUP ---
+st.set_page_config(page_title="Farmer Registration System", page_icon="🌾", layout="wide")
 AUDIO_UPLOAD_DIR = "uploads"
 os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
 create_tables()
 
-# --- GOOGLE SHEET SETTINGS ---
-# Use the exact name of your Google Sheet file
+# --- GOOGLE SHEETS CONNECTION ---
 SHEET_NAME = 'Bahir Dar staff lunch order' 
 
 @st.cache_resource
@@ -31,13 +30,12 @@ def initialize_gsheets():
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json(service_account_info, scope)
         client = gspread.authorize(creds)
-        # Open the sheet and specifically the "Order 1" tab
         return client.open(SHEET_NAME).worksheet("Order 1")
     except Exception as e:
-        st.error(f"GSheet Error: {e}")
+        st.error(f"GSheet Connection Failed: {e}")
         return None
 
-# --- 1. LOGIN PAGE ---
+# --- PAGE: LOGIN ---
 def login_page():
     st.title("👤 System Login")
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -58,103 +56,116 @@ def login_page():
             rp = st.text_input("New Password", type="password")
             if st.button("Register"):
                 if register_user(ru, rp): st.success("Account created!")
-                else: st.error("User exists.")
+                else: st.error("User already exists.")
 
-# --- 2. IMPORT FROM YOUR SHARED SHEET ---
-def import_from_gsheet():
-    st.title("📥 Sync Staff Data")
-    st.info(f"Reading from: {SHEET_NAME} -> Order 1")
+# --- PAGE: MANAGE LOCATIONS (Woreda & Kebele) ---
+def manage_locations():
+    st.title("📍 Manage Woredas & Kebeles")
+    db = SessionLocal()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Add Woreda")
+        new_woreda = st.text_input("Woreda Name")
+        if st.button("Save Woreda"):
+            if new_woreda:
+                w = Woreda(name=new_woreda)
+                db.add(w)
+                db.commit()
+                st.success(f"Woreda '{new_woreda}' added!")
+                st.rerun()
+
+    with col2:
+        st.subheader("Add Kebele")
+        woredas = db.query(Woreda).all()
+        target_woreda = st.selectbox("Select Woreda for Kebele", [w.name for w in woredas])
+        new_kebele = st.text_input("Kebele Name")
+        if st.button("Save Kebele"):
+            w_obj = db.query(Woreda).filter(Woreda.name == target_woreda).first()
+            if w_obj and new_kebele:
+                k = Kebele(name=new_kebele, woreda_id=w_obj.id)
+                db.add(k)
+                db.commit()
+                st.success(f"Kebele '{new_kebele}' added to {target_woreda}!")
+    db.close()
+
+# --- PAGE: SYNC FROM GSHEET ---
+def sync_page():
+    st.title("📥 Sync from Google Sheets")
+    st.write(f"Connecting to: **{SHEET_NAME}**")
     sheet = initialize_gsheets()
     
-    if st.button("Start Sync") and sheet:
-        db = SessionLocal()
-        try:
+    if st.button("Start Import"):
+        if sheet:
+            db = SessionLocal()
             data = sheet.get_all_records()
-            count = 0
             for row in data:
-                # We map 'Dep' from your sheet to 'Woreda' in our DB
-                dep_name = str(row.get("Dep", "General")).strip()
-                staff_name = str(row.get("Staff Name", "")).strip()
-                
-                if staff_name:
-                    # 1. Ensure Department exists
-                    woreda = db.query(Woreda).filter(Woreda.name == dep_name).first()
-                    if not woreda:
-                        woreda = Woreda(name=dep_name)
-                        db.add(woreda)
-                        db.flush()
-                    
-                    # 2. Add as Farmer/Staff if not exists
-                    exists = db.query(Farmer).filter(Farmer.name == staff_name).first()
-                    if not exists:
-                        new_f = Farmer(
-                            name=staff_name,
-                            woreda=dep_name,
-                            kebele="N/A",
-                            phone="0000",
-                            registered_by="GSheet Import"
-                        )
-                        db.add(new_f)
-                        count += 1
+                # We map 'Dep' to Woreda and 'Staff Name' to Farmer
+                w_name = str(row.get("Dep", "General")).strip()
+                if not db.query(Woreda).filter(Woreda.name == w_name).first():
+                    db.add(Woreda(name=w_name))
             db.commit()
-            st.success(f"Successfully imported {count} staff members!")
-        except Exception as e:
-            st.error(f"Sync error: {e}")
-        finally:
+            st.success("Woredas/Departments Synced!")
             db.close()
 
-# --- 3. REGISTRATION PAGE ---
+# --- PAGE: REGISTRATION ---
 def register_page():
-    st.title("🌾 Registration")
+    st.title("📝 Farmer Registration")
     db = SessionLocal()
     woredas = db.query(Woreda).all()
     
     with st.form("reg_form"):
-        name = st.text_input("Staff/Farmer Name")
-        dep_choice = st.selectbox("Department (Woreda)", [w.name for w in woredas]) if woredas else st.warning("Import data first.")
+        name = st.text_input("Farmer/Staff Name")
+        
+        # Woreda Selection
+        w_names = [w.name for w in woredas]
+        sel_woreda = st.selectbox("Select Woreda", w_names if w_names else ["No Woredas Available"])
+        
+        # Kebele Selection (Filtered by Woreda)
+        kebeles = []
+        if woredas:
+            w_obj = db.query(Woreda).filter(Woreda.name == sel_woreda).first()
+            if w_obj:
+                kebeles = [k.name for k in w_obj.kebeles]
+        
+        sel_kebele = st.selectbox("Select Kebele", kebeles if kebeles else ["No Kebeles Available"])
+        
         phone = st.text_input("Phone Number")
-        file = st.file_uploader("Upload Audio/File")
+        file = st.file_uploader("Upload Audio Note")
         
         if st.form_submit_button("Register"):
-            path = None
-            if file:
-                path = os.path.join(AUDIO_UPLOAD_DIR, file.name)
-                with open(path, "wb") as f: f.write(file.getbuffer())
-            
-            new_farmer = Farmer(
-                name=name, woreda=dep_choice, kebele="N/A",
-                phone=phone, audio_path=path, registered_by=st.session_state["username"]
-            )
-            db.add(new_farmer)
-            db.commit()
-            st.success("Registration Complete!")
+            if not w_names or not kebeles:
+                st.error("Please add Woredas and Kebeles first!")
+            else:
+                path = None
+                if file:
+                    path = os.path.join(AUDIO_UPLOAD_DIR, file.name)
+                    with open(path, "wb") as f: f.write(file.getbuffer())
+                
+                new_f = Farmer(
+                    name=name, woreda=sel_woreda, kebele=sel_kebele,
+                    phone=phone, audio_path=path, registered_by=st.session_state["username"]
+                )
+                db.add(new_f)
+                db.commit()
+                st.success(f"Registered {name} successfully!")
+    db.close()
 
-# --- 4. VIEW DATA ---
-def view_page():
-    st.title("📋 Database View")
-    db = SessionLocal()
-    farmers = db.query(Farmer).all()
-    if farmers:
-        df = pd.DataFrame([{
-            "Name": f.name, "Dept": f.woreda, "Phone": f.phone, "By": f.registered_by
-        } for f in farmers])
-        st.table(df)
-    else:
-        st.info("No records yet.")
-
-# --- MAIN NAVIGATION ---
+# --- MAIN APP LOGIC ---
 def main():
     if "logged_in" not in st.session_state or not st.session_state["logged_in"]:
         login_page()
     else:
-        st.sidebar.title(f"User: {st.session_state['username']}")
+        st.sidebar.title(f"Welcome, {st.session_state['username']}")
         menu = {
-            "🌾 Registration": register_page,
-            "📥 Sync GSheet": import_from_gsheet,
-            "📋 View Database": view_page
+            "📝 Registration": register_page,
+            "📍 Manage Locations": manage_locations,
+            "📥 Sync GSheet": sync_page,
+            "📋 View Records": lambda: st.table(pd.DataFrame([{"Name": f.name, "Woreda": f.woreda, "Kebele": f.kebele} for f in SessionLocal().query(Farmer).all()]))
         }
-        choice = st.sidebar.radio("Go to", list(menu.keys()))
-        menu[choice]()
+        choice = st.sidebar.radio("Navigation", list(menu.keys()))
+        if callable(menu[choice]): menu[choice]()
+        
         if st.sidebar.button("Logout"):
             st.session_state.clear()
             st.rerun()
