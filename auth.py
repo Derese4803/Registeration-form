@@ -1,9 +1,14 @@
+import hashlib
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    # Logic to save user to a DB can be added here
+    return True
+
 def login_user(username, password):
-    # Basic check: requires both fields to be filled
+    # Simple check: grant access if both fields are filled
     if username and password:
         return True
     return False
-
-def register_user(username, password):
-    # Place holder for future registration logic
-    return True
