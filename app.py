@@ -21,7 +21,7 @@ os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
 create_tables()
 
 # --- GOOGLE SHEETS CONNECTION ---
-SHEET_NAME = 'Bahir Dar staff lunch order' 
+SHEET_NAME = '2025 Amhara Planting Surivey ' 
 
 @st.cache_resource
 def initialize_gsheets():
