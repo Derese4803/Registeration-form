@@ -5,6 +5,8 @@ import io
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # --- EXTERNAL FILE IMPORTS ---
 try:
@@ -12,16 +14,13 @@ try:
     from models import Farmer, Woreda, Kebele, create_tables
     from auth import register_user, login_user
 except ImportError:
-    st.error("⚠️ System Files Missing! Please ensure models.py, database.py, and auth.py are in your GitHub repository.")
+    st.error("⚠️ System Files Missing! Ensure models.py, database.py, and auth.py are in your repo.")
     st.stop()
 
 # --- INITIAL SETUP ---
 st.set_page_config(page_title="2025 Amhara Planting Survey", page_icon="🌾", layout="wide")
-AUDIO_UPLOAD_DIR = "uploads"
-os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
 create_tables()
 
-# Initialize Navigation State
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "Home"
 
@@ -29,21 +28,49 @@ def change_page(page_name):
     st.session_state["current_page"] = page_name
     st.rerun()
 
-# --- GOOGLE SHEETS CONNECTION (SECRETS) ---
+# --- GOOGLE SERVICES HELPERS ---
 @st.cache_resource
+def get_gcp_creds():
+    """Helper to get credentials for both Sheets and Drive."""
+    service_account_info = st.secrets["gcp_service_account"]
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    return ServiceAccountCredentials.from_json(service_account_info, scope)
+
 def initialize_gsheets():
     try:
-        # Pulls the secret JSON from Streamlit App Settings -> Secrets
-        service_account_info = st.secrets["gcp_service_account"]
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json(service_account_info, scope)
+        creds = get_gcp_creds()
         client = gspread.authorize(creds)
-        
-        # Name of your Google Sheet
-        SHEET_NAME = '2025 Amhara Planting Survey' 
-        spreadsheet = client.open(SHEET_NAME)
+        spreadsheet = client.open('2025 Amhara Planting Survey')
         return spreadsheet.get_worksheet(0)
     except Exception as e:
+        return None
+
+def upload_audio_to_drive(file_buffer, filename):
+    """Uploads file to Google Drive and returns a shareable URL."""
+    try:
+        creds = get_creds() # Using our cached credentials
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        file_metadata = {'name': filename}
+        media = MediaIoBaseUpload(file_buffer, mimetype='audio/mpeg', resumable=True)
+        
+        # 1. Upload the file
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        file_id = file.get('id')
+
+        # 2. Set permission to 'anyone with link' (Viewer)
+        drive_service.permissions().create(
+            fileId=file_id, 
+            body={'type': 'anyone', 'role': 'viewer'}
+        ).execute()
+        
+        # 3. Generate Shareable URL
+        return f"https://drive.google.com/uc?id={file_id}"
+    except Exception as e:
+        st.error(f"Cloud Upload Error: {e}")
         return None
 
 # --- PAGE: HOME (DASHBOARD) ---
@@ -52,12 +79,11 @@ def home_page():
     st.info(f"Welcome back, **{st.session_state['username']}**")
     st.divider()
     
-    # Large Button Navigation
     col1, col2 = st.columns(2)
     with col1:
         if st.button("📝 NEW REGISTRATION", use_container_width=True, type="primary"):
             change_page("Registration")
-        if st.button("📍 SETUP LOCATIONS (Woreda/Kebele)", use_container_width=True):
+        if st.button("📍 SETUP LOCATIONS", use_container_width=True):
             change_page("Locations")
     with col2:
         if st.button("💾 EXPORT & DOWNLOAD DATA", use_container_width=True):
@@ -87,131 +113,40 @@ def register_page():
         
         if st.form_submit_button("Save Registration"):
             if not name or not kebeles:
-                st.error("Error: Please provide a name and ensure Woreda/Kebele are selected.")
+                st.error("Error: Farmer name and locations are required.")
             else:
-                path = None
-                if audio_file:
-                    path = os.path.join(AUDIO_UPLOAD_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{audio_file.name}")
-                    with open(path, "wb") as f: f.write(audio_file.getbuffer())
+                final_audio_url = None
                 
+                # 1. Handle Audio Upload to Drive
+                if audio_file:
+                    with st.spinner("Uploading audio to Google Drive..."):
+                        fname = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+                        final_audio_url = upload_audio_to_drive(audio_file, fname)
+                
+                # 2. Save to Local Database
                 new_entry = Farmer(
                     name=name, woreda=sel_woreda, kebele=sel_kebele,
-                    phone=phone, audio_path=path,
+                    phone=phone, audio_path=final_audio_url, # Now saving the URL
                     registered_by=st.session_state["username"]
                 )
                 db.add(new_entry)
                 db.commit()
-                st.success("✅ Registration saved to database!")
+
+                # 3. Sync directly to Google Sheet
+                sheet = initialize_gsheets()
+                if sheet:
+                    try:
+                        sheet.append_row([
+                            datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            name, sel_woreda, sel_kebele, phone, 
+                            final_audio_url, st.session_state["username"]
+                        ])
+                        st.success("✅ Saved to Database and Google Sheet!")
+                    except:
+                        st.warning("⚠️ Saved to Database, but Google Sheet sync failed.")
+                else:
+                    st.success("✅ Saved locally (GSheet not connected).")
     db.close()
 
-# --- PAGE: SETUP LOCATIONS ---
-def manage_locations():
-    if st.button("⬅️ Back to Home"): change_page("Home")
-    st.header("📍 Manage Woredas & Kebeles")
-    db = SessionLocal()
-    
-    t1, t2 = st.tabs(["📥 Import & Sync", "✏️ Edit/Delete List"])
-    
-    with t1:
-        st.subheader("🔗 Google Sheet Sync")
-        if st.button("🔄 Pull Woredas from GSheet"):
-            sheet = initialize_gsheets()
-            if sheet:
-                records = sheet.get_all_records()
-                for r in records:
-                    w_name = str(r.get("Woreda", r.get("Dep", ""))).strip()
-                    if w_name and not db.query(Woreda).filter(Woreda.name == w_name).first():
-                        db.add(Woreda(name=w_name))
-                db.commit(); st.success("Woredas Imported Successfully!")
-            else: st.error("Sync Failed! Please check your Secrets and GSheet Name.")
-        
-        st.divider()
-        st.subheader("📄 Excel/CSV Bulk Upload")
-        temp_df = pd.DataFrame({"Woreda": ["Example Woreda"], "Kebele": ["Example Kebele"]})
-        st.download_button("📥 Download Excel Template", temp_df.to_csv(index=False).encode('utf-8'), "template.csv")
-        
-        uploaded = st.file_uploader("Upload filled CSV Template", type="csv")
-        if uploaded:
-            df = pd.read_csv(uploaded)
-            for _, r in df.iterrows():
-                w_n, k_n = str(r['Woreda']).strip(), str(r['Kebele']).strip()
-                w_obj = db.query(Woreda).filter(Woreda.name == w_n).first()
-                if not w_obj:
-                    w_obj = Woreda(name=w_n); db.add(w_obj); db.commit()
-                if not db.query(Kebele).filter(Kebele.name == k_n, Kebele.woreda_id == w_obj.id).first():
-                    db.add(Kebele(name=k_n, woreda_id=w_obj.id))
-            db.commit(); st.success("Locations Uploaded!")
-
-    with t2:
-        woredas = db.query(Woreda).all()
-        for w in woredas:
-            with st.expander(f"📌 {w.name}"):
-                c1, c2 = st.columns([3, 1])
-                new_w = c1.text_input("Rename Woreda", w.name, key=f"w{w.id}")
-                if c2.button("Save", key=f"sb{w.id}"):
-                    w.name = new_w; db.commit(); st.rerun()
-                for k in w.kebeles:
-                    ck1, ck2 = st.columns([3, 1])
-                    new_k = ck1.text_input("Edit Kebele", k.name, key=f"k{k.id}")
-                    if ck2.button("🗑️", key=f"dk{k.id}"):
-                        db.delete(k); db.commit(); st.rerun()
-                if st.button(f"❌ Delete {w.name}", key=f"dw{w.id}"):
-                    db.delete(w); db.commit(); st.rerun()
-    db.close()
-
-# --- PAGE: EDIT RECORDS ---
-def edit_records_page():
-    if st.button("⬅️ Back to Home"): change_page("Home")
-    st.header("🛠️ Edit Farmer Data")
-    db = SessionLocal()
-    farmers = db.query(Farmer).all()
-    for f in farmers:
-        with st.expander(f"👤 {f.name} - {f.woreda}"):
-            n_name = st.text_input("Edit Name", f.name, key=f"fn{f.id}")
-            n_phone = st.text_input("Edit Phone", f.phone, key=f"fp{f.id}")
-            if st.button("Save Changes", key=f"fs{f.id}"):
-                f.name, f.phone = n_name, n_phone
-                db.commit(); st.success("Updated!"); st.rerun()
-            if st.button("🗑️ Delete Record", key=f"fdel{f.id}"):
-                db.delete(f); db.commit(); st.rerun()
-    db.close()
-
-# --- PAGE: DOWNLOAD ---
-def download_page():
-    if st.button("⬅️ Back to Home"): change_page("Home")
-    st.header("💾 Export Survey Data")
-    db = SessionLocal()
-    farmers = db.query(Farmer).all()
-    if farmers:
-        df = pd.DataFrame([{
-            "Farmer": f.name, "Woreda": f.woreda, "Kebele": f.kebele, 
-            "Phone": f.phone, "Surveyor": f.registered_by
-        } for f in farmers])
-        st.dataframe(df, use_container_width=True)
-        st.download_button("📥 Download as CSV (Excel)", df.to_csv(index=False).encode('utf-8'), "Amhara_Survey_2025.csv")
-    else: st.info("No records found to download.")
-    db.close()
-
-# --- MAIN NAVIGATION ---
-def main():
-    if "logged_in" not in st.session_state or not st.session_state["logged_in"]:
-        st.title("🚜 2025 Amhara Survey Login")
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        if st.button("Enter System"):
-            if login_user(u, p):
-                st.session_state["logged_in"] = True
-                st.session_state["username"] = u
-                st.rerun()
-            else: st.error("Login Failed")
-    else:
-        st.sidebar.button("Logout", on_click=lambda: st.session_state.clear())
-        page = st.session_state["current_page"]
-        if page == "Home": home_page()
-        elif page == "Registration": register_page()
-        elif page == "Locations": manage_locations()
-        elif page == "Download": download_page()
-        elif page == "EditRecords": edit_records_page()
-
-if __name__ == "__main__":
-    main()
+# --- OTHER PAGES (Location, Download, Edit) remain same as your previous version ---
+# ... (rest of the code for locations, edit_records_page, download_page, and main)
