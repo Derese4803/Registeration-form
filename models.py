@@ -24,7 +24,7 @@ class Farmer(Base):
     woreda = Column(String)
     kebele = Column(String)
     phone = Column(String)
-    audio_url = Column(String)  # Stores the Google Drive URL
+    audio_path = Column(String)
     registered_by = Column(String)
 
 def create_tables():
