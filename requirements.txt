@@ -1,5 +1,6 @@
 streamlit
 pandas
+sqlalchemy
 gspread
 oauth2client
-sqlalchemy
+google-api-python-client
