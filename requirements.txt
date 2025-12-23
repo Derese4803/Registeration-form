@@ -3,4 +3,3 @@ pandas
 sqlalchemy
 gspread
 oauth2client
-google-api-python-client
